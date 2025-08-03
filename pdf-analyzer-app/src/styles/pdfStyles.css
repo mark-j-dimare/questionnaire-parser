@@ -1,0 +1,36 @@
+.pdf-section {
+    margin-bottom: 2rem;
+    padding: 1rem;
+    background-color: #fff;
+    color: #000;
+    border-radius: 0.5rem;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+
+.pdf-section h2 {
+    font-size: 1.125rem;
+    font-weight: 600;
+    margin-bottom: 0.5rem;
+}
+
+.canvas-wrapper {
+    overflow-x: auto;
+    width: 100%;
+    background: #f9f9f9;
+    border-radius: 0.25rem;
+    border: 1px solid #e0e0e0;
+    padding: 1rem 0;
+    text-align: center;
+}
+
+canvas {
+    display: block;
+    margin: 0 auto;
+    border: 1px solid #ccc;
+    width: auto !important;
+    /* Important: prevent CSS scaling */
+    height: auto !important;
+    /* Keep aspect ratio */
+    max-width: none !important;
+    /* Disable any max-width limits */
+}
