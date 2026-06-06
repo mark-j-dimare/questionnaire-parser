@@ -22,6 +22,12 @@ const CheckIcon = (props) => (
     <polyline points="20 6 9 17 4 12" />
   </svg>
 );
+const TrashIcon = (props) => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>
+    <polyline points="3 6 5 6 21 6" />
+    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+  </svg>
+);
 
 // Small "confirmed by you" badge shown on cells the user has set/confirmed.
 const ConfirmBadge = () => (
@@ -33,7 +39,7 @@ const ConfirmBadge = () => (
 const BASE_CELL =
   "absolute rounded-md p-0 transition-all duration-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-1 focus-visible:ring-offset-white";
 
-const PageReview = ({ page, onChangeAnswer, onManualRealign }) => {
+const PageReview = ({ page, onChangeAnswer, onManualRealign, onRemove }) => {
   const questions = QUESTIONS.filter((q) => q.page === page.pageIndex);
   const detById = new Map(page.detection.map((d) => [d.question, d]));
   const flagged = flaggedForPage(page);
@@ -94,13 +100,25 @@ const PageReview = ({ page, onChangeAnswer, onManualRealign }) => {
             </span>
           )}
         </div>
-        <button
-          onClick={onManualRealign}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
-        >
-          <CrosshairIcon className="h-3.5 w-3.5" />
-          Re-align
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onManualRealign}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
+          >
+            <CrosshairIcon className="h-3.5 w-3.5" />
+            Re-align
+          </button>
+          {onRemove && (
+            <button
+              onClick={onRemove}
+              aria-label={`Remove ${page.label}`}
+              title={`Remove ${page.label}`}
+              className="inline-flex items-center justify-center rounded-lg border border-slate-300 bg-white p-1.5 text-slate-500 transition-colors hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
+            >
+              <TrashIcon className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
       </div>
 
       {flagged.length > 0 && (

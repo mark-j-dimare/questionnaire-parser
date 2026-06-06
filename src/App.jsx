@@ -35,6 +35,76 @@ const ScanIcon = (props) => (
   </svg>
 );
 
+// Alignment-point thresholds. A real SCARED page matches with hundreds of points;
+// a different document matches with only a handful.
+const RECOGNIZE_MIN = 25; // below this we don't accept it as a SCARED page at all
+const STRONG_INLIERS = 60; // above this, auto-alignment is confident
+const FORM_PAGES = [0, 1];
+
+function makeThumb(canvas, targetW = 100) {
+  const scale = targetW / canvas.width;
+  const c = document.createElement("canvas");
+  c.width = targetW;
+  c.height = Math.max(1, Math.round(canvas.height * scale));
+  c.getContext("2d").drawImage(canvas, 0, 0, c.width, c.height);
+  return c.toDataURL("image/png");
+}
+
+const amberBtn =
+  "rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 transition-colors hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2";
+
+const UnrecognizedCard = ({ page, onRealign, onRemove }) => (
+  <div className="flex items-start gap-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+    <img
+      src={page.thumbUrl}
+      alt=""
+      className="h-20 w-auto shrink-0 rounded ring-1 ring-amber-200"
+    />
+    <div className="min-w-0 flex-1">
+      <div className="flex items-center gap-2">
+        <AlertIcon className="h-4 w-4 shrink-0 text-amber-700" />
+        <h3 className="text-sm font-semibold text-amber-900">
+          Not recognized as a SCARED form page
+        </h3>
+      </div>
+      <p className="mt-1 text-xs leading-relaxed text-amber-800">
+        <span className="font-medium">{page.fileName}</span> didn't match the SCARED
+        questionnaire
+        {typeof page.inliers === "number" ? ` (only ${page.inliers} alignment points)` : ""}
+        , so it isn't included in the score. If it really is a SCARED page that was hard
+        to read, align it manually — otherwise remove it.
+      </p>
+      <div className="mt-3 flex gap-2">
+        <button onClick={onRealign} className={amberBtn}>
+          Align manually
+        </button>
+        <button onClick={onRemove} className={amberBtn}>
+          Remove
+        </button>
+      </div>
+    </div>
+  </div>
+);
+
+const MissingPageCard = ({ pageIndex, onAdd }) => (
+  <div className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-white p-8 text-center">
+    <ScanIcon className="mb-2 h-8 w-8 text-slate-300" />
+    <p className="text-sm font-medium text-slate-700">
+      Page {pageIndex + 1} not added yet
+    </p>
+    <p className="mb-3 mt-1 text-xs text-slate-500">
+      This form has two pages. Add the photo or scan of page {pageIndex + 1} to
+      complete the score.
+    </p>
+    <button
+      onClick={onAdd}
+      className="rounded-lg bg-teal-600 px-3.5 py-2 text-sm font-semibold text-white transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
+    >
+      Add page {pageIndex + 1}
+    </button>
+  </div>
+);
+
 function App() {
   const [pages, setPages] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -43,25 +113,32 @@ function App() {
   const [manualPageId, setManualPageId] = useState(null);
 
   const idRef = useRef(0);
+  const fileInputRef = useRef(null);
+  const openFilePicker = () => fileInputRef.current?.click();
 
   const pageFromResult = (result, canvas, fileName) => {
     const answers = {};
     result.detection.forEach((d) => {
       answers[d.question] = d.selectedIndex;
     });
+    const inliers = result.inliers || 0;
+    const recognized = !!result.alignedCanvas && inliers >= RECOGNIZE_MIN;
+    const strong = inliers >= STRONG_INLIERS;
     return {
       id: ++idRef.current,
       pageIndex: result.pageIndex,
       label: `Page ${result.pageIndex + 1}`,
       fileName,
       sourceCanvas: canvas,
+      thumbUrl: makeThumb(canvas),
       alignedUrl: result.alignedCanvas
         ? result.alignedCanvas.toDataURL("image/png")
         : null,
       inliers: result.inliers,
       matches: result.matches,
-      aligned: result.ok,
-      alignMode: result.ok ? "auto" : result.alignedCanvas ? "auto-weak" : "failed",
+      recognized,
+      aligned: recognized && strong,
+      alignMode: !recognized ? "unrecognized" : strong ? "auto" : "auto-weak",
       answers,
       detection: result.detection,
       confirmed: new Set(), // questions the user has set/confirmed by hand
@@ -124,6 +201,8 @@ function App() {
     );
   };
 
+  const removePage = (id) => setPages((prev) => prev.filter((p) => p.id !== id));
+
   const applyManual = async (corners) => {
     const page = pages.find((p) => p.id === manualPageId);
     if (!page) return setManualPageId(null);
@@ -144,6 +223,7 @@ function App() {
                 detection: result.detection,
                 answers,
                 confirmed: new Set(),
+                recognized: true,
                 aligned: true,
                 alignMode: "manual",
               }
@@ -164,20 +244,60 @@ function App() {
     setError(null);
   };
 
+  const recognizedPages = useMemo(() => pages.filter((p) => p.recognized), [pages]);
+  const unrecognizedPages = useMemo(
+    () => pages.filter((p) => !p.recognized),
+    [pages]
+  );
+
   const score = useMemo(() => {
     const merged = {};
-    pages.forEach((p) => {
+    recognizedPages.forEach((p) => {
       Object.entries(p.answers).forEach(([q, v]) => {
         merged[q] = v;
       });
     });
     return computeScore(merged);
-  }, [pages]);
+  }, [recognizedPages]);
 
-  const flags = useMemo(() => flagStats(pages), [pages]);
+  const flags = useMemo(() => flagStats(recognizedPages), [recognizedPages]);
+
+  // Completeness / duplicate checks across the recognized pages.
+  const presentPages = new Set(recognizedPages.map((p) => p.pageIndex));
+  const missingPages = recognizedPages.length
+    ? FORM_PAGES.filter((i) => !presentPages.has(i))
+    : [];
+  const duplicatePages = FORM_PAGES.filter(
+    (i) => recognizedPages.filter((p) => p.pageIndex === i).length > 1
+  );
 
   const manualPage = pages.find((p) => p.id === manualPageId);
   const hasPages = pages.length > 0;
+  const hasRecognized = recognizedPages.length > 0;
+
+  // Single source of truth for the sticky status bar.
+  const status = !hasRecognized
+    ? {
+        tone: "warn",
+        text: "Couldn't recognize a SCARED form in your upload. Make sure you're uploading the child SCARED questionnaire.",
+      }
+    : missingPages.length
+    ? {
+        tone: "warn",
+        text: `Page ${missingPages
+          .map((i) => i + 1)
+          .join(" & ")} not uploaded yet — the score is incomplete.`,
+      }
+    : duplicatePages.length
+    ? {
+        tone: "warn",
+        text: `Two uploads matched Page ${duplicatePages
+          .map((i) => i + 1)
+          .join(", ")} — remove the duplicate or add the missing page.`,
+      }
+    : flags.total > 0
+    ? { tone: "warn", review: true }
+    : { tone: "ok" };
 
   return (
     <div className="min-h-screen w-full bg-canvas text-slate-900">
@@ -212,18 +332,25 @@ function App() {
           </div>
         </div>
 
-        {/* Sticky review-status row — stays visible while scrolling both pages. */}
+        {/* Sticky status row — stays visible while scrolling both pages. */}
         {hasPages && (
           <div
             aria-live="polite"
             className={`border-t ${
-              flags.total > 0
-                ? "border-amber-100 bg-amber-50"
-                : "border-green-100 bg-green-50"
+              status.tone === "ok"
+                ? "border-green-100 bg-green-50"
+                : "border-amber-100 bg-amber-50"
             }`}
           >
             <div className="mx-auto flex max-w-6xl items-center gap-2 px-4 py-2 text-sm sm:px-6 lg:px-8">
-              {flags.total > 0 ? (
+              {status.tone === "ok" ? (
+                <>
+                  <CheckCircleIcon className="h-4 w-4 shrink-0 text-green-700" />
+                  <span className="font-medium text-green-800">
+                    All items answered — nothing flagged for review.
+                  </span>
+                </>
+              ) : status.review ? (
                 <>
                   <AlertIcon className="h-4 w-4 shrink-0 text-amber-700" />
                   <span className="font-semibold text-amber-900">
@@ -237,9 +364,9 @@ function App() {
                 </>
               ) : (
                 <>
-                  <CheckCircleIcon className="h-4 w-4 shrink-0 text-green-700" />
-                  <span className="font-medium text-green-800">
-                    All items answered — nothing flagged for review.
+                  <AlertIcon className="h-4 w-4 shrink-0 text-amber-700" />
+                  <span className="truncate font-medium text-amber-900">
+                    {status.text}
                   </span>
                 </>
               )}
@@ -296,11 +423,36 @@ function App() {
           </div>
         ) : (
           <>
-            {/* Confident results header */}
-            <section
-              aria-live="polite"
-              className="mb-6 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
-            >
+            {unrecognizedPages.length > 0 && (
+              <div className="mb-6 space-y-3">
+                {unrecognizedPages.map((page) => (
+                  <UnrecognizedCard
+                    key={page.id}
+                    page={page}
+                    onRealign={() => setManualPageId(page.id)}
+                    onRemove={() => removePage(page.id)}
+                  />
+                ))}
+              </div>
+            )}
+
+            {!hasRecognized ? (
+              <div className="rounded-xl border-2 border-dashed border-slate-200 bg-white py-12 text-center">
+                <p className="text-sm font-medium text-slate-700">
+                  No SCARED form recognized yet
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  Upload clear photos or scans of both pages of the child SCARED
+                  questionnaire to read and score it.
+                </p>
+              </div>
+            ) : (
+              <>
+                {/* Confident results header */}
+                <section
+                  aria-live="polite"
+                  className="mb-6 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+                >
               <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-baseline gap-3">
                   <span className="text-4xl font-bold tabular-nums tracking-tight text-slate-900">
@@ -336,26 +488,49 @@ function App() {
               </div>
             </section>
 
-            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
-              <div className="space-y-6">
-                {pages.map((page) => (
-                  <PageReview
-                    key={page.id}
-                    page={page}
-                    onChangeAnswer={(q, v, confirmed) =>
-                      changeAnswer(page.id, q, v, confirmed)
-                    }
-                    onManualRealign={() => setManualPageId(page.id)}
-                  />
-                ))}
-              </div>
-              <div className="space-y-4 lg:sticky lg:top-28 lg:self-start">
-                <ScorePanel score={score} />
-              </div>
-            </div>
+                <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
+                  <div className="space-y-6">
+                    {recognizedPages.map((page) => (
+                      <PageReview
+                        key={page.id}
+                        page={page}
+                        onChangeAnswer={(q, v, confirmed) =>
+                          changeAnswer(page.id, q, v, confirmed)
+                        }
+                        onManualRealign={() => setManualPageId(page.id)}
+                        onRemove={() => removePage(page.id)}
+                      />
+                    ))}
+                    {missingPages.map((idx) => (
+                      <MissingPageCard
+                        key={`missing-${idx}`}
+                        pageIndex={idx}
+                        onAdd={openFilePicker}
+                      />
+                    ))}
+                  </div>
+                  <div className="space-y-4 lg:sticky lg:top-28 lg:self-start">
+                    <ScorePanel score={score} />
+                  </div>
+                </div>
+              </>
+            )}
           </>
         )}
       </main>
+
+      {/* Shared hidden picker for the "Add page" placeholder buttons. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*,application/pdf"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          handleFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
 
       {manualPage && (
         <ManualAlign
