@@ -28,6 +28,7 @@ Upload → decode → **align to a known template** → detect marks → score. 
 - **`src/data/scaredForm.js`** — the form definition. Reuses `childQuestionnaireMap.js` (the 41×3 answer-cell boxes), adds question text, `CANON_SCALE`, the reference template images, and the scoring config (subscale labels + cutoffs, total cutoff).
 - **`src/utils/score.js`** — total + subscale tally from a `{question: 0|1|2|null}` map.
 - **`src/utils/flags.js`** — shared "needs review" logic (`flaggedForPage`, `flagStats`, `LOW_CONFIDENCE`). Used by both the per-page banner and the global status bar so they always agree.
+- **`src/components/ManualEntry.jsx` + `ReferenceImages.jsx`** — the **manual-entry mode**, a second path that bypasses the CV pipeline entirely. Real-world uploads are inconsistent, so the app has a "Scan a form" / "Enter by hand" toggle: the hand mode renders all 41 items as a blank on-screen form (three targets per row, `0`/`1`/`2` keys answer and advance) scored by the same `computeScore`, with an optional side-by-side viewer for the user's own photo/scan/PDF (decoded via `fileToCanvases`, **no OpenCV, no alignment**). Scanned answers can be copied into it as a starting point.
 - **`src/App.jsx`** — orchestration + UI state: recognition gating, completeness/duplicate detection, the sticky status bar, per-page state (answers, user-confirmations, alignment mode), and the manual-align modal.
 
 ## Non-obvious constraints (read before changing these areas)

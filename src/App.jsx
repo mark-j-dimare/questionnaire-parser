@@ -3,6 +3,9 @@ import Uploader from "./components/Uploader";
 import PageReview from "./components/PageReview";
 import ScorePanel from "./components/ScorePanel";
 import ManualAlign from "./components/ManualAlign";
+import ManualEntry from "./components/ManualEntry";
+import ReferenceImages from "./components/ReferenceImages";
+import { QUESTIONS } from "./data/scaredForm";
 import { fileToCanvases } from "./utils/imaging";
 import { initCv, processCanvas, warpCanvas } from "./utils/cvClient";
 import { computeScore } from "./utils/score";
@@ -105,12 +108,59 @@ const MissingPageCard = ({ pageIndex, onAdd }) => (
   </div>
 );
 
+// Headline total + cutoff verdict. Shared by the scan and manual-entry views.
+const ResultsHeader = ({ score }) => (
+  <section
+    aria-live="polite"
+    className="mb-6 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
+  >
+    <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex items-baseline gap-3">
+        <span className="text-4xl font-bold tabular-nums tracking-tight text-slate-900">
+          {score.total}
+        </span>
+        <span className="text-sm text-slate-500">total SCARED score</span>
+      </div>
+      <span
+        className={
+          score.totalElevated
+            ? "inline-flex items-center gap-2 rounded-full bg-amber-100 px-3.5 py-1.5 text-sm font-semibold text-amber-900 ring-1 ring-amber-200"
+            : "inline-flex items-center gap-2 rounded-full bg-green-100 px-3.5 py-1.5 text-sm font-semibold text-green-800 ring-1 ring-green-200"
+        }
+      >
+        <span
+          className={`h-2 w-2 rounded-full ${score.totalElevated ? "bg-amber-600" : "bg-green-600"}`}
+          aria-hidden="true"
+        />
+        {score.totalElevated
+          ? `At or above screening cutoff (≥ ${score.totalCutoff})`
+          : `Below screening cutoff (< ${score.totalCutoff})`}
+      </span>
+    </div>
+    <div className="px-5 pb-5">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+        <div
+          className="h-full rounded-full bg-teal-500 transition-all motion-reduce:transition-none"
+          style={{ width: `${(score.answered / score.totalQuestions) * 100}%` }}
+        />
+      </div>
+    </div>
+  </section>
+);
+
 function App() {
   const [pages, setPages] = useState([]);
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState("");
   const [error, setError] = useState(null);
   const [manualPageId, setManualPageId] = useState(null);
+
+  // "scan" = read the form from a photo/PDF; "manual" = blank on-screen form the
+  // user fills in by eye (for uploads too messy for the scanner to read).
+  const [mode, setMode] = useState("scan");
+  const [manualAnswers, setManualAnswers] = useState({});
+  const [refImages, setRefImages] = useState([]);
+  const [refBusy, setRefBusy] = useState(false);
 
   const idRef = useRef(0);
   const fileInputRef = useRef(null);
@@ -240,8 +290,44 @@ function App() {
   };
 
   const reset = () => {
-    setPages([]);
+    if (mode === "manual") {
+      setManualAnswers({});
+      setRefImages([]);
+    } else {
+      setPages([]);
+    }
     setError(null);
+  };
+
+  // --- Manual entry -------------------------------------------------------
+  const setManualAnswer = (question, value) =>
+    setManualAnswers((prev) => ({ ...prev, [question]: value }));
+
+  // Decode reference photos/PDFs for side-by-side viewing only — no OpenCV.
+  const addReferenceImages = async (files) => {
+    const fileList = Array.from(files);
+    if (!fileList.length) return;
+    setRefBusy(true);
+    try {
+      const added = [];
+      for (const file of fileList) {
+        try {
+          const canvases = await fileToCanvases(file);
+          canvases.forEach((canvas, i) =>
+            added.push({
+              id: ++idRef.current,
+              name: canvases.length > 1 ? `${file.name} (p${i + 1})` : file.name,
+              url: canvas.toDataURL("image/png"),
+            })
+          );
+        } catch (e) {
+          setError(`Could not read "${file.name}": ${e.message}`);
+        }
+      }
+      setRefImages((prev) => [...prev, ...added]);
+    } finally {
+      setRefBusy(false);
+    }
   };
 
   const recognizedPages = useMemo(() => pages.filter((p) => p.recognized), [pages]);
@@ -250,15 +336,27 @@ function App() {
     [pages]
   );
 
-  const score = useMemo(() => {
+  const scannedAnswers = useMemo(() => {
     const merged = {};
     recognizedPages.forEach((p) => {
       Object.entries(p.answers).forEach(([q, v]) => {
         merged[q] = v;
       });
     });
-    return computeScore(merged);
+    return merged;
   }, [recognizedPages]);
+
+  const copyScanIntoManual = () => setManualAnswers({ ...scannedAnswers });
+
+  const manualAnsweredCount = useMemo(
+    () => QUESTIONS.filter((q) => manualAnswers[q.question] != null).length,
+    [manualAnswers]
+  );
+
+  const score = useMemo(
+    () => computeScore(mode === "manual" ? manualAnswers : scannedAnswers),
+    [mode, manualAnswers, scannedAnswers]
+  );
 
   const flags = useMemo(() => flagStats(recognizedPages), [recognizedPages]);
 
@@ -274,6 +372,10 @@ function App() {
   const manualPage = pages.find((p) => p.id === manualPageId);
   const hasPages = pages.length > 0;
   const hasRecognized = recognizedPages.length > 0;
+  const manualMode = mode === "manual";
+  const canClear = manualMode
+    ? manualAnsweredCount > 0 || refImages.length > 0
+    : hasPages;
 
   // Single source of truth for the sticky status bar.
   const status = !hasRecognized
@@ -321,7 +423,7 @@ function App() {
               <span className="h-1.5 w-1.5 rounded-full bg-teal-500" aria-hidden="true" />
               Runs locally — nothing leaves this device
             </span>
-            {hasPages && (
+            {canClear && (
               <button
                 onClick={reset}
                 className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
@@ -333,7 +435,7 @@ function App() {
         </div>
 
         {/* Sticky status row — stays visible while scrolling both pages. */}
-        {hasPages && (
+        {hasPages && !manualMode && (
           <div
             aria-live="polite"
             className={`border-t ${
@@ -376,20 +478,51 @@ function App() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8">
+        {/* Scan vs. type-it-in. Manual entry is the fallback when a photo or PDF
+            is too inconsistent for the scanner to read reliably. */}
+        <div
+          role="tablist"
+          aria-label="How to enter answers"
+          className="mb-5 inline-flex rounded-lg bg-slate-100 p-1"
+        >
+          {[
+            { key: "scan", label: "Scan a form" },
+            { key: "manual", label: "Enter by hand" },
+          ].map((t) => (
+            <button
+              key={t.key}
+              role="tab"
+              aria-selected={mode === t.key}
+              onClick={() => setMode(t.key)}
+              className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2 ${
+                mode === t.key
+                  ? "bg-white text-slate-900 shadow-sm"
+                  : "text-slate-600 hover:text-slate-900"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
         <div className="mb-6 max-w-2xl">
           <h2 className="text-sm font-semibold text-slate-900">
-            Scan &amp; score a child SCARED questionnaire
+            {manualMode
+              ? "Fill in a child SCARED questionnaire by hand"
+              : "Scan & score a child SCARED questionnaire"}
           </h2>
           <p className="mt-1 text-sm leading-relaxed text-slate-600">
-            Add photos or scans of both form pages. Answers are detected and scored
-            automatically — review the highlighted circles and correct any the scanner
-            flagged.
+            {manualMode
+              ? "A blank form to type into when the photo or PDF is too messy to scan. Copy the marked answers off the paper and the score updates as you go."
+              : "Add photos or scans of both form pages. Answers are detected and scored automatically — review the highlighted circles and correct any the scanner flagged."}
           </p>
         </div>
 
-        <div className="mb-4">
-          <Uploader onFiles={handleFiles} busy={busy} />
-        </div>
+        {!manualMode && (
+          <div className="mb-4">
+            <Uploader onFiles={handleFiles} busy={busy} />
+          </div>
+        )}
 
         {busy && stage && (
           <div
@@ -412,7 +545,29 @@ function App() {
           </div>
         )}
 
-        {!hasPages ? (
+        {manualMode ? (
+          <>
+            <ResultsHeader score={score} />
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
+              <ManualEntry
+                answers={manualAnswers}
+                onChange={setManualAnswer}
+                onClear={() => setManualAnswers({})}
+                onCopyFromScan={hasRecognized ? copyScanIntoManual : null}
+                answeredCount={manualAnsweredCount}
+              />
+              <div className="space-y-4 lg:sticky lg:top-24 lg:self-start">
+                <ReferenceImages
+                  images={refImages}
+                  onAdd={addReferenceImages}
+                  onClear={() => setRefImages([])}
+                  busy={refBusy}
+                />
+                <ScorePanel score={score} />
+              </div>
+            </div>
+          </>
+        ) : !hasPages ? (
           <div className="rounded-xl border-2 border-dashed border-slate-200 bg-white py-16 text-center">
             <ScanIcon className="mx-auto mb-3 h-10 w-10 text-slate-300" />
             <p className="text-sm font-medium text-slate-700">No forms loaded yet</p>
@@ -445,48 +600,16 @@ function App() {
                   Upload clear photos or scans of both pages of the child SCARED
                   questionnaire to read and score it.
                 </p>
+                <button
+                  onClick={() => setMode("manual")}
+                  className="mt-4 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
+                >
+                  Enter the answers by hand instead
+                </button>
               </div>
             ) : (
               <>
-                {/* Confident results header */}
-                <section
-                  aria-live="polite"
-                  className="mb-6 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200"
-                >
-              <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex items-baseline gap-3">
-                  <span className="text-4xl font-bold tabular-nums tracking-tight text-slate-900">
-                    {score.total}
-                  </span>
-                  <span className="text-sm text-slate-500">total SCARED score</span>
-                </div>
-                <span
-                  className={
-                    score.totalElevated
-                      ? "inline-flex items-center gap-2 rounded-full bg-amber-100 px-3.5 py-1.5 text-sm font-semibold text-amber-900 ring-1 ring-amber-200"
-                      : "inline-flex items-center gap-2 rounded-full bg-green-100 px-3.5 py-1.5 text-sm font-semibold text-green-800 ring-1 ring-green-200"
-                  }
-                >
-                  <span
-                    className={`h-2 w-2 rounded-full ${score.totalElevated ? "bg-amber-600" : "bg-green-600"}`}
-                    aria-hidden="true"
-                  />
-                  {score.totalElevated
-                    ? `At or above screening cutoff (≥ ${score.totalCutoff})`
-                    : `Below screening cutoff (< ${score.totalCutoff})`}
-                </span>
-              </div>
-              <div className="px-5 pb-5">
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
-                  <div
-                    className="h-full rounded-full bg-teal-500 transition-all motion-reduce:transition-none"
-                    style={{
-                      width: `${(score.answered / score.totalQuestions) * 100}%`,
-                    }}
-                  />
-                </div>
-              </div>
-            </section>
+                <ResultsHeader score={score} />
 
                 <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
                   <div className="space-y-6">
