@@ -57,6 +57,22 @@ function makeThumb(canvas, targetW = 100) {
 // The worker returns the photo -> canonical homography; inverting it and pushing
 // the canonical answer-table quad back through gives the four points the overlay
 // should put its handles on.
+// Missing and duplicate pages are reported together, because they almost always
+// occur together: photographing page 1 twice leaves page 2 missing. Reporting
+// only the missing page (which is what a plain if/else chain does) tells the
+// user to add a page while saying nothing about the duplicate they need to
+// remove -- and two identical "Page 1" cards look like a rendering glitch.
+function pageProblemText(missing, duplicate) {
+  const list = (a) => a.map((i) => i + 1).join(" & ");
+  if (duplicate.length && missing.length) {
+    return `Page ${list(duplicate)} was uploaded twice and page ${list(missing)} is missing — remove the duplicate and add the missing page.`;
+  }
+  if (duplicate.length) {
+    return `Two uploads matched page ${list(duplicate)} — remove the one you don't want; only the last is scored.`;
+  }
+  return `Page ${list(missing)} not uploaded yet — the score is incomplete.`;
+}
+
 function cornersFromHomography(H, pageIndex) {
   const quad = TABLE_QUADS[pageIndex];
   if (!H || H.length !== 9 || !quad) return null;
@@ -390,20 +406,8 @@ function App() {
         tone: "warn",
         text: "Couldn't recognize a SCARED form in your upload. Make sure you're uploading the child SCARED questionnaire.",
       }
-    : missingPages.length
-    ? {
-        tone: "warn",
-        text: `Page ${missingPages
-          .map((i) => i + 1)
-          .join(" & ")} not uploaded yet — the score is incomplete.`,
-      }
-    : duplicatePages.length
-    ? {
-        tone: "warn",
-        text: `Two uploads matched Page ${duplicatePages
-          .map((i) => i + 1)
-          .join(", ")} — remove the duplicate or add the missing page.`,
-      }
+    : missingPages.length || duplicatePages.length
+    ? { tone: "warn", text: pageProblemText(missingPages, duplicatePages) }
     : flags.total > 0
     ? { tone: "warn", review: true }
     : { tone: "ok" };
