@@ -8,7 +8,10 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "sync-opencv": "cp node_modules/@techstark/opencv-js/dist/opencv.js public/opencv.js"
+    "sync-opencv": "cp node_modules/@techstark/opencv-js/dist/opencv.js public/opencv.js",
+    "harness": "node tools/harness/detect.cjs",
+    "harness:fixtures": "node tools/harness/fixtures.cjs",
+    "harness:e2e": "node tools/harness/fixtures.cjs && node tools/harness/browser.mjs"
   },
   "dependencies": {
     "@techstark/opencv-js": "^4.12.0-release.1",
