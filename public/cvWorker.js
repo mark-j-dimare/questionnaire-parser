@@ -95,10 +95,14 @@ function flatField(gray) {
 }
 
 // Ink map: high where the page is darker than its local paper level.
+// The 3x3 median kills sensor/JPEG speckle while leaving thin pen strokes
+// intact -- unlike a morphological opening, which erases them. Applied to the
+// template too, so both sides of the subtraction are filtered identically.
 function inkOf(gray) {
   const flat = flatField(gray);
   const ink = new cv.Mat();
   cv.bitwise_not(flat, ink);
+  cv.medianBlur(ink, ink, 3);
   flat.delete();
   return ink;
 }
@@ -115,15 +119,22 @@ function refInkDilated(refGray, tol) {
   return dil;
 }
 
-// Per answer cell, the bbox of the printed target grown by `pad`. Scoring this
-// instead of the whole cell excludes the table rules structurally and lifts the
-// mark-to-area ratio about 3x.
-function targetWindows(refGray, boxes, pad, canon) {
+// Per answer cell, work out (a) the region we COUNT new ink in -- the whole
+// cell, inset to clear the table rules -- and (b) the area we NORMALISE by,
+// derived from the printed target's bbox grown by `pad`.
+//
+// Counting over the whole cell matters because people do not mark consistently:
+// checks land beside the target, lines get drawn through or under it, circles
+// are drawn far larger than it. Scoring only a window around the printed "o"
+// missed all of those. Normalising by the small window area (rather than the
+// ~3x larger cell) keeps the dynamic range wide, so a faint mark anywhere in
+// the cell still scores well clear of the noise floor.
+function cellRegions(refGray, boxes, pad, inset, canon) {
   const ink = inkOf(refGray);
   const W = ink.cols, D = ink.data;
   const out = boxes.map((q) => ({
     question: q.question,
-    windows: q.boxes.map((b) => {
+    cells: q.boxes.map((b) => {
       const x0 = Math.round(b.x * canon), y0 = Math.round(b.y * canon);
       const w0 = Math.round(b.width * canon), h0 = Math.round(b.height * canon);
       let minx = Infinity, miny = Infinity, maxx = -1, maxy = -1;
@@ -137,19 +148,14 @@ function targetWindows(refGray, boxes, pad, canon) {
           }
         }
       }
-      if (maxx < 0) { // no printed target found; fall back to the cell centre
-        const cx = x0 + w0 / 2, cy = y0 + h0 / 2;
-        minx = cx - 6; maxx = cx + 6; miny = cy - 6; maxy = cy + 6;
-      }
-      let x = Math.round(minx) - pad, y = Math.round(miny) - pad;
-      let w = Math.round(maxx - minx) + 1 + 2 * pad;
-      let h = Math.round(maxy - miny) + 1 + 2 * pad;
-      const lx = x0 + 1, ly = y0 + 1, rx = x0 + w0 - 1, ry = y0 + h0 - 1;
-      if (x < lx) { w -= lx - x; x = lx; }
-      if (y < ly) { h -= ly - y; y = ly; }
-      if (x + w > rx) w = rx - x;
-      if (y + h > ry) h = ry - y;
-      return { x, y, width: w, height: h };
+      if (maxx < 0) { const cx = x0 + w0 / 2, cy = y0 + h0 / 2; minx = cx - 6; maxx = cx + 6; miny = cy - 6; maxy = cy + 6; }
+      const normArea = Math.max(1,
+        (Math.round(maxx - minx) + 1 + 2 * pad) * (Math.round(maxy - miny) + 1 + 2 * pad));
+      return {
+        x: x0 + inset, y: y0 + inset,
+        width: Math.max(1, w0 - 2 * inset), height: Math.max(1, h0 - 2 * inset),
+        normArea,
+      };
     }),
   }));
   ink.delete();
@@ -169,7 +175,11 @@ function rowStrips(refFlat, boxes, canon, searchPx) {
     const strip = new cv.Mat();
     view.copyTo(strip); // clone() would alias refFlat
     view.delete();
-    return { question: q.question, rect, strip };
+    // The question-text half of the band: template content only, never a mark,
+    // and it IS row-registered -- so leftover ink here is pure image noise.
+    const firstCellX = Math.min.apply(null, q.boxes.map((b) => Math.round(b.x * canon)));
+    const noiseRect = new cv.Rect(rect.x, rect.y, Math.max(1, firstCellX - 10 - rect.x), rect.height);
+    return { question: q.question, rect, noiseRect, strip };
   });
 }
 
@@ -233,10 +243,27 @@ function residualMask(gray, inkRefDil, inkDelta) {
   cv.subtract(ink, inkRefDil, resid); // 8U saturating: >0 only where page ink is new
   const mask = new cv.Mat();
   cv.threshold(resid, mask, inkDelta, 255, cv.THRESH_BINARY);
-  const ko = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
-  cv.morphologyEx(mask, mask, cv.MORPH_OPEN, ko); // drop JPEG/sensor speckle
-  ink.delete(); resid.delete(); ko.delete();
+  ink.delete(); resid.delete();
+  // NB: a MORPH_OPEN here looks like the obvious despeckle, but it destroys the
+  // very marks we need -- a drawn underline lost 100% of its pixels and a line
+  // through the target lost 86%. Speckle is removed by blob area instead (see
+  // countInk), which keeps thin strokes intact.
   return mask;
+}
+
+// New-ink pixels inside `rect`, ignoring blobs smaller than `minBlob` so sensor
+// and JPEG speckle does not register while real strokes survive.
+function countInk(mask, rect, minBlob) {
+  const roi = mask.roi(rect);
+  const labels = new cv.Mat(), stats = new cv.Mat(), cent = new cv.Mat();
+  let px = 0;
+  const n = cv.connectedComponentsWithStats(roi, labels, stats, cent, 8, cv.CV_32S);
+  for (let i = 1; i < n; i++) {
+    const a = stats.intAt(i, cv.CC_STAT_AREA);
+    if (a >= minBlob) px += a;
+  }
+  roi.delete(); labels.delete(); stats.delete(); cent.delete();
+  return px;
 }
 
 function doInit(msg) {
@@ -261,7 +288,7 @@ function doInit(msg) {
     return {
       gray, kp, des, width: r.width, height: r.height,
       inkDil: refInkDilated(gray, P.tolerancePx),
-      windows: targetWindows(gray, boxes, P.padPx, cfg.canonScale),
+      cells: cellRegions(gray, boxes, P.padPx, P.cellInsetPx, cfg.canonScale),
       strips,
     };
   });
@@ -366,26 +393,57 @@ function detectAnswers(alignedMat, pageIndex) {
   const mask = residualMask(fixed, r.inkDil, P.inkDelta);
   fixed.delete();
 
-  // 3. Score the target window of every cell.
-  const scored = r.windows.map((q) => ({
+  // 3a. Graininess: unexplained ink in the QUESTION-TEXT part of each answer
+  //     row. That area is row-registered like the cells, and it can never hold
+  //     a mark -- so anything left there is image noise. This is the one signal
+  //     that separates "a faint mark" from "a grainy image that happens to put
+  //     a blob in a cell"; per-cell statistics cannot, because the two have the
+  //     same magnitude. Measuring the whole page instead would false-alarm on
+  //     any shifted page, since only the row bands get re-registered.
+  let noisePx = 0, noiseArea = 0;
+  r.strips.forEach((st) => {
+    const nr = st.noiseRect;
+    if (nr.width <= 0 || nr.height <= 0) return;
+    const roi = mask.roi(nr);
+    noisePx += cv.countNonZero(roi);
+    noiseArea += nr.width * nr.height;
+    roi.delete();
+  });
+  const pageResidual = noiseArea ? noisePx / noiseArea : 0;
+
+  // 3b. Score every cell.
+  const scored = r.cells.map((q) => ({
     question: q.question,
-    scores: q.windows.map((w) => {
-      if (w.width <= 0 || w.height <= 0) return 0;
-      const roi = mask.roi(new cv.Rect(w.x, w.y, w.width, w.height));
-      const v = cv.countNonZero(roi) / (w.width * w.height);
-      roi.delete();
-      return v;
+    scores: q.cells.map((c) => {
+      if (c.width <= 0 || c.height <= 0) return 0;
+      const px = countInk(mask, new cv.Rect(c.x, c.y, c.width, c.height), P.minBlob);
+      return Math.min(1, px / c.normArea);
     }),
   }));
   mask.delete();
 
-  // 4. Page-wide noise floor. With 123 cells and at most 41 marks, most cells
-  //    are guaranteed blank, so their spread is a free estimate of the floor.
+  // 4. Page-wide noise floor. Only one cell per row can be the answer, so the
+  //    2nd- and 3rd-ranked cells of every row are GUARANTEED blank -- 82 known
+  //    blank samples per page. Their upper tail is a direct measurement of what
+  //    "unmarked" scores on this particular image, which a median/MAD over all
+  //    123 cells cannot give (on a clean page both collapse to zero, leaving no
+  //    headroom, and a very noisy page then produces phantom answers).
   const all = [];
   scored.forEach((q) => q.scores.forEach((v) => all.push(v)));
+  const blanks = [];
+  scored.forEach((q) => {
+    const r = q.scores.slice().sort((a, b) => b - a);
+    for (let i = 1; i < r.length; i++) blanks.push(r[i]);
+  });
+  blanks.sort((a, b) => a - b);
+  const blankP95 = blanks.length ? blanks[Math.min(blanks.length - 1, Math.floor(blanks.length * 0.95))] : 0;
   const med = medianOf(all);
   const mad = medianOf(all.map((v) => Math.abs(v - med)));
-  const floor = Math.max(P.minInk, med + 6 * (1.4826 * mad + 1e-6));
+  const floor = Math.max(
+    P.minInk,
+    med + 6 * (1.4826 * mad + 1e-6),
+    blankP95 * P.blankMargin
+  );
 
   const detection = scored.map(({ question, scores }) => {
     const ranked = scores.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v);
@@ -410,6 +468,13 @@ function detectAnswers(alignedMat, pageIndex) {
     };
   });
 
+  // How many GUARANTEED-blank cells still carry ink? On a clean page this is 0.
+  // A couple means the respondent left stray marks or corrected an answer; a
+  // handful means the image is too grainy (or too misaligned) to trust, which
+  // the median residual alone does not catch when the grain lands in only a few
+  // cells.
+  const blanksAboveFloor = blanks.filter((v) => v >= floor).length;
+
   const rowQuality = offsets.map((o) => o.q);
   return {
     detection,
@@ -417,10 +482,16 @@ function detectAnswers(alignedMat, pageIndex) {
       residualMedian: med,
       residualMad: mad,
       floor,
+      blankP95,
       // The single most useful derived signal: if the template is not
       // cancelling, the page is misaligned or too poor to read -- say so
       // instead of silently reporting 41 answers.
-      noisy: med > P.noisyPage,
+      blanksAboveFloor,
+      pageResidual,
+      noisy:
+        med > P.noisyPage ||
+        blanksAboveFloor >= P.maxStrayBlanks ||
+        pageResidual > P.maxPageResidual,
       rowQualityMin: Math.min.apply(null, rowQuality),
       rowQualityMedian: medianOf(rowQuality),
       rowsFilled: offsets.filter((o) => o.filled).length,

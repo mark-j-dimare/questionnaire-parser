@@ -18,7 +18,10 @@ const CONFIG = {
     // See public/cvWorker.js — these must stay in sync with it (that file is
     // deliberately not bundled, so it cannot import this one).
     inkDelta: 40,        // residual grey (of 255) that counts as new ink
-    padPx: 8,            // target window = printed target's bbox grown by this
+    padPx: 8,            // normalisation area = printed target's bbox grown by this
+    cellInsetPx: 3,      // shrink the scored cell by this to clear the table rules
+                         // (the bottom rule is immediately adjacent to the cell)
+    minBlob: 12,         // ignore new-ink blobs smaller than this (residual speckle)
     tolerancePx: 1,      // template ink dilation; misregistration tolerance.
                          // NB: >1 fills the printed "o" ring into a solid disc
                          // and blinds us to filled-in marks. Do not raise.
@@ -29,6 +32,12 @@ const CONFIG = {
     strongInk: 0.030,    // score at which a mark is "unambiguously present"
     searchPx: 8,         // per-row local registration search radius
     minRowQuality: 0.45, // min NCC for a row's local offset to be trusted
+    blankMargin: 2.0,    // floor must also exceed p95 of the known-blank cells
+                         // (the 2nd/3rd ranked cell of each row) by this factor
+    maxStrayBlanks: 3,   // this many known-blank cells carrying ink => the page
+                         // is too grainy/misaligned to trust
+    maxPageResidual: 0.010, // whole-page unexplained-ink fraction above this =>
+                            // the image is too grainy to trust (calibrated below)
     noisyPage: 0.020,    // residual median above this => alignment/scan too poor
   },
   // Answer-cell geometry grouped by page (the worker stays data-agnostic).
