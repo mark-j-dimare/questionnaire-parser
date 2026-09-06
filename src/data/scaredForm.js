@@ -14,6 +14,16 @@ import blankP1 from "../assets/reference/blank_p1.png";
 export const CANON_SCALE = 2;
 export const CANON_WIDTH = 612 * CANON_SCALE; // 1224
 export const CANON_HEIGHT = 792 * CANON_SCALE; // 1584
+// Outer border of the answer table on each page, in canonical (1224x1584)
+// pixels, measured from the reference templates. These four corners are the
+// landmark the user drags onto in the grid overlay: unlike the page corners
+// they are crisp ruled lines, and they stay visible even when the photo crops
+// or shadows the edge of the sheet. Order: TL, TR, BR, BL.
+export const TABLE_QUADS = [
+  [{ x: 135, y: 517 }, { x: 1099, y: 517 }, { x: 1099, y: 1471 }, { x: 135, y: 1471 }],
+  [{ x: 129, y: 282 }, { x: 1093, y: 282 }, { x: 1093, y: 1337 }, { x: 129, y: 1337 }],
+];
+
 export const REFERENCE_PAGES = [blankP0, blankP1];
 export const PAGE_COUNT = REFERENCE_PAGES.length;
 

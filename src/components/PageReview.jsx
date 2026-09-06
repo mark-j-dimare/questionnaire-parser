@@ -106,7 +106,7 @@ const PageReview = ({ page, onChangeAnswer, onManualRealign, onRemove }) => {
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
           >
             <CrosshairIcon className="h-3.5 w-3.5" />
-            Re-align
+            Back to my photo
           </button>
           {onRemove && (
             <button

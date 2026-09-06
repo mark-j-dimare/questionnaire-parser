@@ -2,14 +2,15 @@ import { useMemo, useRef, useState } from "react";
 import Uploader from "./components/Uploader";
 import PageReview from "./components/PageReview";
 import ScorePanel from "./components/ScorePanel";
-import ManualAlign from "./components/ManualAlign";
+import GridOverlay from "./components/GridOverlay";
 import ManualEntry from "./components/ManualEntry";
 import ReferenceImages from "./components/ReferenceImages";
-import { QUESTIONS } from "./data/scaredForm";
+import { QUESTIONS, TABLE_QUADS } from "./data/scaredForm";
 import { fileToCanvases } from "./utils/imaging";
 import { initCv, processCanvas, warpCanvas } from "./utils/cvClient";
 import { computeScore } from "./utils/score";
 import { flagStats } from "./utils/flags";
+import { invertH, applyH } from "./utils/homography";
 
 const ClipboardIcon = (props) => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" {...props}>
@@ -53,41 +54,17 @@ function makeThumb(canvas, targetW = 100) {
   return c.toDataURL("image/png");
 }
 
-const amberBtn =
-  "rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-900 transition-colors hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 focus-visible:ring-offset-2";
-
-const UnrecognizedCard = ({ page, onRealign, onRemove }) => (
-  <div className="flex items-start gap-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
-    <img
-      src={page.thumbUrl}
-      alt=""
-      className="h-20 w-auto shrink-0 rounded ring-1 ring-amber-200"
-    />
-    <div className="min-w-0 flex-1">
-      <div className="flex items-center gap-2">
-        <AlertIcon className="h-4 w-4 shrink-0 text-amber-700" />
-        <h3 className="text-sm font-semibold text-amber-900">
-          Not recognized as a SCARED form page
-        </h3>
-      </div>
-      <p className="mt-1 text-xs leading-relaxed text-amber-800">
-        <span className="font-medium">{page.fileName}</span> didn't match the SCARED
-        questionnaire
-        {typeof page.inliers === "number" ? ` (only ${page.inliers} alignment points)` : ""}
-        , so it isn't included in the score. If it really is a SCARED page that was hard
-        to read, align it manually — otherwise remove it.
-      </p>
-      <div className="mt-3 flex gap-2">
-        <button onClick={onRealign} className={amberBtn}>
-          Align manually
-        </button>
-        <button onClick={onRemove} className={amberBtn}>
-          Remove
-        </button>
-      </div>
-    </div>
-  </div>
-);
+// The worker returns the photo -> canonical homography; inverting it and pushing
+// the canonical answer-table quad back through gives the four points the overlay
+// should put its handles on.
+function cornersFromHomography(H, pageIndex) {
+  const quad = TABLE_QUADS[pageIndex];
+  if (!H || H.length !== 9 || !quad) return null;
+  const inv = invertH(H);
+  if (!inv) return null;
+  const pts = quad.map((p) => applyH(inv, p));
+  return pts.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y)) ? pts : null;
+}
 
 const MissingPageCard = ({ pageIndex, onAdd }) => (
   <div className="flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-slate-300 bg-white p-8 text-center">
@@ -153,7 +130,12 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [stage, setStage] = useState("");
   const [error, setError] = useState(null);
-  const [manualPageId, setManualPageId] = useState(null);
+  // Every page is reviewed on the user's own photo with the answer grid drawn
+  // over it -- that shows the detected answers AND lets the alignment be fixed
+  // in the same place. These are the pages the user has flipped to the
+  // straightened (rectified) view instead.
+  const [straightenedIds, setStraightenedIds] = useState(() => new Set());
+  const [aligningId, setAligningId] = useState(null);
 
   // "scan" = read the form from a photo/PDF; "manual" = blank on-screen form the
   // user fills in by eye (for uploads too messy for the scanner to read).
@@ -174,6 +156,9 @@ function App() {
     const inliers = result.inliers || 0;
     const recognized = !!result.alignedCanvas && inliers >= RECOGNIZE_MIN;
     const strong = inliers >= STRONG_INLIERS;
+    // Where the answer table's corners landed in the ORIGINAL photo, so the grid
+    // overlay can start from the automatic alignment rather than a blind guess.
+    const corners = cornersFromHomography(result.homography, result.pageIndex);
     return {
       id: ++idRef.current,
       pageIndex: result.pageIndex,
@@ -191,6 +176,8 @@ function App() {
       alignMode: !recognized ? "unrecognized" : strong ? "auto" : "auto-weak",
       answers,
       detection: result.detection,
+      quality: result.quality || null,
+      corners,
       confirmed: new Set(), // questions the user has set/confirmed by hand
     };
   };
@@ -251,41 +238,65 @@ function App() {
     );
   };
 
+  const toggleStraightened = (id, on) =>
+    setStraightenedIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+
   const removePage = (id) => setPages((prev) => prev.filter((p) => p.id !== id));
 
-  const applyManual = async (corners) => {
-    const page = pages.find((p) => p.id === manualPageId);
-    if (!page) return setManualPageId(null);
-    setBusy(true);
-    setStage("Re-aligning…");
+  // Re-read a page from four user-placed corners of the answer table. Called on
+  // every handle release, so the grid and the answers update as the user drags.
+  const alignFromCorners = async (pageId, corners, pageIndexOverride) => {
+    const page = pages.find((p) => p.id === pageId);
+    if (!page) return;
+    const pageIndex = pageIndexOverride ?? page.pageIndex;
+    // Aligning marks the page recognized, which would otherwise swap the grid
+    // out for the review view mid-drag. Keep the user in the grid until they
+    // say they're done with it.
+    setAligningId(pageId);
     try {
-      const result = await warpCanvas(page.sourceCanvas, corners, page.pageIndex);
+      const result = await warpCanvas(
+        page.sourceCanvas,
+        corners,
+        pageIndex,
+        TABLE_QUADS[pageIndex]
+      );
       const answers = {};
       result.detection.forEach((d) => {
         answers[d.question] = d.selectedIndex;
       });
       setPages((prev) =>
-        prev.map((p) =>
-          p.id === manualPageId
-            ? {
-                ...p,
-                alignedUrl: result.alignedCanvas.toDataURL("image/png"),
-                detection: result.detection,
-                answers,
-                confirmed: new Set(),
-                recognized: true,
-                aligned: true,
-                alignMode: "manual",
-              }
-            : p
-        )
+        prev
+          .map((p) =>
+            p.id === pageId
+              ? {
+                  ...p,
+                  pageIndex,
+                  label: `Page ${pageIndex + 1}`,
+                  alignedUrl: result.alignedCanvas
+                    ? result.alignedCanvas.toDataURL("image/png")
+                    : p.alignedUrl,
+                  detection: result.detection,
+                  quality: result.quality || null,
+                  answers,
+                  corners,
+                  confirmed: new Set(),
+                  recognized: true,
+                  aligned: true,
+                  alignMode: "manual",
+                }
+              : p
+          )
+          .sort((a, b) => a.pageIndex - b.pageIndex)
       );
     } catch (e) {
-      setError(`Manual alignment failed: ${e.message}`);
+      setError(`Could not read that alignment: ${e.message}`);
     } finally {
-      setBusy(false);
-      setStage("");
-      setManualPageId(null);
+      setAligningId(null);
     }
   };
 
@@ -331,10 +342,6 @@ function App() {
   };
 
   const recognizedPages = useMemo(() => pages.filter((p) => p.recognized), [pages]);
-  const unrecognizedPages = useMemo(
-    () => pages.filter((p) => !p.recognized),
-    [pages]
-  );
 
   const scannedAnswers = useMemo(() => {
     const merged = {};
@@ -369,7 +376,7 @@ function App() {
     (i) => recognizedPages.filter((p) => p.pageIndex === i).length > 1
   );
 
-  const manualPage = pages.find((p) => p.id === manualPageId);
+
   const hasPages = pages.length > 0;
   const hasRecognized = recognizedPages.length > 0;
   const manualMode = mode === "manual";
@@ -547,7 +554,7 @@ function App() {
 
         {manualMode ? (
           <>
-            <ResultsHeader score={score} />
+            {hasRecognized && <ResultsHeader score={score} />}
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
               <ManualEntry
                 answers={manualAnswers}
@@ -578,66 +585,78 @@ function App() {
           </div>
         ) : (
           <>
-            {unrecognizedPages.length > 0 && (
-              <div className="mb-6 space-y-3">
-                {unrecognizedPages.map((page) => (
-                  <UnrecognizedCard
-                    key={page.id}
-                    page={page}
-                    onRealign={() => setManualPageId(page.id)}
-                    onRemove={() => removePage(page.id)}
-                  />
-                ))}
-              </div>
-            )}
+            {hasRecognized && <ResultsHeader score={score} />}
 
-            {!hasRecognized ? (
-              <div className="rounded-xl border-2 border-dashed border-slate-200 bg-white py-12 text-center">
-                <p className="text-sm font-medium text-slate-700">
-                  No SCARED form recognized yet
-                </p>
-                <p className="mt-1 text-xs text-slate-500">
-                  Upload clear photos or scans of both pages of the child SCARED
-                  questionnaire to read and score it.
-                </p>
-                <button
-                  onClick={() => setMode("manual")}
-                  className="mt-4 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
-                >
-                  Enter the answers by hand instead
-                </button>
-              </div>
-            ) : (
-              <>
-                <ResultsHeader score={score} />
-
-                <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
-                  <div className="space-y-6">
-                    {recognizedPages.map((page) => (
-                      <PageReview
-                        key={page.id}
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_340px]">
+              <div className="space-y-6">
+                {/* One list, no dead ends: a page the scanner could not place
+                    shows the alignment grid instead of an error card, and any
+                    page can be switched to the grid to adjust it. */}
+                {pages.map((page) =>
+                  straightenedIds.has(page.id) ? (
+                    <PageReview
+                      key={page.id}
+                      page={page}
+                      onChangeAnswer={(q, v, confirmed) =>
+                        changeAnswer(page.id, q, v, confirmed)
+                      }
+                      onManualRealign={() => toggleStraightened(page.id, false)}
+                      onRemove={() => removePage(page.id)}
+                    />
+                  ) : (
+                    <div key={page.id} className="space-y-2">
+                      {!page.recognized && (
+                        <div className="flex items-start gap-2.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+                          <AlertIcon className="mt-0.5 h-4 w-4 shrink-0 text-amber-700" />
+                          <p>
+                            <span className="font-medium">{page.fileName}</span>{" "}
+                            couldn&apos;t be lined up automatically
+                            {typeof page.inliers === "number"
+                              ? ` (only ${page.inliers} alignment points)`
+                              : ""}
+                            . Drag the four handles onto the answer table below and it
+                            will be read and scored — or remove it if it isn&apos;t a
+                            SCARED page.
+                          </p>
+                        </div>
+                      )}
+                      <GridOverlay
                         page={page}
+                        sourceCanvas={page.sourceCanvas}
+                        pageIndex={page.pageIndex}
+                        initialCorners={page.corners}
+                        detection={page.detection}
+                        answers={page.answers}
+                        confirmed={page.confirmed}
+                        quality={page.quality}
+                        busy={aligningId === page.id}
+                        onAlign={(corners) => alignFromCorners(page.id, corners)}
+                        onPageIndexChange={(idx, cs) =>
+                          alignFromCorners(page.id, cs, idx)
+                        }
                         onChangeAnswer={(q, v, confirmed) =>
                           changeAnswer(page.id, q, v, confirmed)
                         }
-                        onManualRealign={() => setManualPageId(page.id)}
+                        onShowStraightened={
+                          page.alignedUrl ? () => toggleStraightened(page.id, true) : null
+                        }
                         onRemove={() => removePage(page.id)}
                       />
-                    ))}
-                    {missingPages.map((idx) => (
-                      <MissingPageCard
-                        key={`missing-${idx}`}
-                        pageIndex={idx}
-                        onAdd={openFilePicker}
-                      />
-                    ))}
-                  </div>
-                  <div className="space-y-4 lg:sticky lg:top-28 lg:self-start">
-                    <ScorePanel score={score} />
-                  </div>
-                </div>
-              </>
-            )}
+                    </div>
+                  )
+                )}
+                {missingPages.map((idx) => (
+                  <MissingPageCard
+                    key={`missing-${idx}`}
+                    pageIndex={idx}
+                    onAdd={openFilePicker}
+                  />
+                ))}
+              </div>
+              <div className="space-y-4 lg:sticky lg:top-28 lg:self-start">
+                <ScorePanel score={score} />
+              </div>
+            </div>
           </>
         )}
       </main>
@@ -655,13 +674,6 @@ function App() {
         }}
       />
 
-      {manualPage && (
-        <ManualAlign
-          sourceCanvas={manualPage.sourceCanvas}
-          onApply={applyManual}
-          onCancel={() => setManualPageId(null)}
-        />
-      )}
     </div>
   );
 }

@@ -139,7 +139,9 @@ export async function processCanvas(canvas) {
 }
 
 // Manually align one page from 4 corner points, then read it.
-export async function warpCanvas(canvas, corners, pageIndex) {
+// `dest` (optional) is the canonical-space quad the four corners map onto --
+// the grid overlay passes the answer-table quad. Omit it for whole-page corners.
+export async function warpCanvas(canvas, corners, pageIndex, dest) {
   await initCv();
   const img = canvasToImageData(canvas);
   const res = await request(
@@ -147,6 +149,7 @@ export async function warpCanvas(canvas, corners, pageIndex) {
       type: "warp",
       pageIndex,
       corners,
+      dest,
       page: { width: img.width, height: img.height, buffer: img.data.buffer },
     },
     [img.data.buffer]
@@ -160,6 +163,10 @@ function normalize(res) {
     pageIndex: res.pageIndex ?? 0,
     inliers: res.inliers,
     matches: res.matches,
+    // photo -> canonical, when auto-alignment produced one. Inverting it gives
+    // the photo-space position of the table corners, so the overlay can start
+    // from the automatic result instead of a blind default rectangle.
+    homography: res.homography || null,
     aligned: res.aligned ? res.aligned : null,
     alignedCanvas: res.aligned ? alignedToCanvas(res.aligned) : null,
     detection: res.detection || [],

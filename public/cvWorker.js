@@ -297,7 +297,9 @@ function doInit(msg) {
 // Align `photo` (RGBA Mat) to reference `r` using cached ref features.
 // Returns { inliers, matches, alignedMat|null }.
 function alignToRef(photo, photoKp, photoDes, r) {
-  if (photoDes.rows < 4 || r.des.rows < 4) return { inliers: 0, matches: 0, alignedMat: null };
+  if (photoDes.rows < 4 || r.des.rows < 4) {
+    return { inliers: 0, matches: 0, alignedMat: null, homography: null };
+  }
   const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
   const knn = new cv.DMatchVectorVector();
   bf.knnMatch(photoDes, r.des, knn, 2);
@@ -318,7 +320,7 @@ function alignToRef(photo, photoKp, photoDes, r) {
   knn.delete();
   bf.delete();
   const matches = src.length / 2;
-  if (matches < 4) return { inliers: 0, matches, alignedMat: null };
+  if (matches < 4) return { inliers: 0, matches, alignedMat: null, homography: null };
 
   const srcM = cv.matFromArray(matches, 1, cv.CV_32FC2, src);
   const dstM = cv.matFromArray(matches, 1, cv.CV_32FC2, dst);
@@ -333,7 +335,7 @@ function alignToRef(photo, photoKp, photoDes, r) {
   mask.delete();
   if (!inliers) {
     if (H) H.delete();
-    return { inliers: 0, matches, alignedMat: null };
+    return { inliers: 0, matches, alignedMat: null, homography: null };
   }
   const aligned = new cv.Mat();
   cv.warpPerspective(
@@ -345,11 +347,15 @@ function alignToRef(photo, photoKp, photoDes, r) {
     cv.BORDER_CONSTANT,
     new cv.Scalar(255, 255, 255, 255)
   );
+  const hArr = Array.from(H.data64F);
   H.delete();
-  return { inliers, matches, alignedMat: aligned };
+  return { inliers, matches, alignedMat: aligned, homography: hArr };
 }
 
-function warpFromCorners(photo, corners, pageIndex) {
+// `dest` is where the four dragged corners should land in canonical space. The
+// grid overlay passes the answer-table quad (crisp ruled corners, always visible
+// in a photo); with no `dest` we fall back to the whole page, as before.
+function warpFromCorners(photo, corners, pageIndex, dest) {
   const r = refs[pageIndex];
   const from = cv.matFromArray(
     4,
@@ -357,9 +363,10 @@ function warpFromCorners(photo, corners, pageIndex) {
     cv.CV_32FC2,
     corners.flatMap((c) => [c.x, c.y])
   );
-  const to = cv.matFromArray(4, 1, cv.CV_32FC2, [
-    0, 0, r.width, 0, r.width, r.height, 0, r.height,
-  ]);
+  const toPts = dest && dest.length === 4
+    ? dest.flatMap((c) => [c.x, c.y])
+    : [0, 0, r.width, 0, r.width, r.height, 0, r.height];
+  const to = cv.matFromArray(4, 1, cv.CV_32FC2, toPts);
   const H = cv.getPerspectiveTransform(from, to);
   const aligned = new cv.Mat();
   cv.warpPerspective(
@@ -538,6 +545,7 @@ function doProcess(msg) {
     pageIndex: best.i,
     inliers: best.inliers,
     matches: best.matches,
+    homography: best.homography || null,
     aligned,
     detection: det.detection,
     quality: det.quality,
@@ -546,7 +554,7 @@ function doProcess(msg) {
 
 function doWarp(msg) {
   const photo = matFromBuf(msg.page.buffer, msg.page.width, msg.page.height);
-  const alignedMat = warpFromCorners(photo, msg.corners, msg.pageIndex);
+  const alignedMat = warpFromCorners(photo, msg.corners, msg.pageIndex, msg.dest);
   photo.delete();
   const det = detectAnswers(alignedMat, msg.pageIndex);
   const aligned = alignedToTransfer(alignedMat);
