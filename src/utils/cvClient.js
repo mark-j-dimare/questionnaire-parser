@@ -13,11 +13,23 @@ const CONFIG = {
   minInliers: 18,
   canonScale: CANON_SCALE,
   detect: {
-    darkThreshold: 128,
-    minFill: 0.028,
-    minRatio: 1.4,
-    minMargin: 0.012,
-    saturated: 0.5,
+    // Marks are found by DIFFERENCING the aligned page against the blank
+    // template, scored inside a small window centred on each printed target.
+    // See public/cvWorker.js — these must stay in sync with it (that file is
+    // deliberately not bundled, so it cannot import this one).
+    inkDelta: 40,        // residual grey (of 255) that counts as new ink
+    padPx: 8,            // target window = printed target's bbox grown by this
+    tolerancePx: 1,      // template ink dilation; misregistration tolerance.
+                         // NB: >1 fills the printed "o" ring into a solid disc
+                         // and blinds us to filled-in marks. Do not raise.
+    minInk: 0.010,       // absolute floor: fraction of the window that is new ink
+    minRatio: 2.5,       // winner must beat the runner-up by this factor
+    minMargin: 0.006,    // ...and by this absolute margin
+    multiRatio: 0.45,    // runner-up above this fraction of the winner => two marks
+    strongInk: 0.030,    // score at which a mark is "unambiguously present"
+    searchPx: 8,         // per-row local registration search radius
+    minRowQuality: 0.45, // min NCC for a row's local offset to be trusted
+    noisyPage: 0.020,    // residual median above this => alignment/scan too poor
   },
   // Answer-cell geometry grouped by page (the worker stays data-agnostic).
   boxesByPage: QUESTIONS.reduce((acc, q) => {
@@ -142,6 +154,10 @@ function normalize(res) {
     aligned: res.aligned ? res.aligned : null,
     alignedCanvas: res.aligned ? alignedToCanvas(res.aligned) : null,
     detection: res.detection || [],
+    // Page-level read quality from the differencing pass. `noisy` means the
+    // blank template did not cancel, i.e. the page is misaligned or too poor to
+    // read -- surface that instead of trusting the answers.
+    quality: res.quality || null,
     ok: res.ok,
   };
 }

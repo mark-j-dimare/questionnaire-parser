@@ -50,9 +50,193 @@ function orbFeatures(gray) {
   const orb = new cv.ORB(cfg.orbFeatures);
   const kp = new cv.KeyPointVector();
   const des = new cv.Mat();
-  orb.detectAndCompute(gray, new cv.Mat(), kp, des);
+  const noMask = new cv.Mat();
+  orb.detectAndCompute(gray, noMask, kp, des);
+  noMask.delete(); // leaked in the original: one wasm-heap Mat per call
   orb.delete();
   return { kp, des };
+}
+
+/* ---------------------------------------------------------------------------
+ * Mark detection by TEMPLATE DIFFERENCING.
+ *
+ * The old approach counted pixels darker than a fixed grey inside each answer
+ * cell. That cannot work on this form: the printed target is the letter "o", so
+ * a *blank* cell already scores 0.0144-0.0181 against a 0.028 gate, the blank
+ * baseline varies 26% between columns of one row, and the table rules sit 0-4px
+ * outside the cell, so a few px of misregistration adds up to +0.057 -- twice
+ * the entire threshold budget.
+ *
+ * Instead: flat-field the page (removes shadow/exposure), subtract the blank
+ * template's ink (removes the printed "o", the rules and the text), and measure
+ * what is left inside a small window centred on each printed target. A blank
+ * cell then scores ~0.000 and a mark scores 0.02-0.27.
+ *
+ * IMPORTANT opencv.js gotchas relied on below:
+ *   - Mat.clone() ALIASES the source data in this build. Use copyTo(new Mat).
+ *   - srcRoi.copyTo(dstRoi) is a no-op; write sub-rects via data.set().
+ * ------------------------------------------------------------------------- */
+
+// Divide out the illumination field so paper reads ~250 whatever the lighting.
+function flatField(gray) {
+  const small = new cv.Mat();
+  cv.resize(gray, small, new cv.Size(gray.cols >> 2, gray.rows >> 2), 0, 0, cv.INTER_AREA);
+  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9));
+  const bgS = new cv.Mat();
+  // MORPH_CLOSE at 1/4 scale removes every dark structure narrower than ~36px
+  // full-scale (text, rules, pen marks), leaving only the lighting.
+  cv.morphologyEx(small, bgS, cv.MORPH_CLOSE, k);
+  const bg = new cv.Mat();
+  cv.resize(bgS, bg, new cv.Size(gray.cols, gray.rows), 0, 0, cv.INTER_CUBIC);
+  const flat = new cv.Mat();
+  cv.divide(gray, bg, flat, 250);
+  small.delete(); k.delete(); bgS.delete(); bg.delete();
+  return flat;
+}
+
+// Ink map: high where the page is darker than its local paper level.
+function inkOf(gray) {
+  const flat = flatField(gray);
+  const ink = new cv.Mat();
+  cv.bitwise_not(flat, ink);
+  flat.delete();
+  return ink;
+}
+
+// The template's ink, dilated by `tol` px so small misregistration still cancels.
+function refInkDilated(refGray, tol) {
+  const ink = inkOf(refGray);
+  if (tol <= 0) return ink;
+  const d = 2 * tol + 1;
+  const k = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(d, d));
+  const dil = new cv.Mat();
+  cv.dilate(ink, dil, k);
+  ink.delete(); k.delete();
+  return dil;
+}
+
+// Per answer cell, the bbox of the printed target grown by `pad`. Scoring this
+// instead of the whole cell excludes the table rules structurally and lifts the
+// mark-to-area ratio about 3x.
+function targetWindows(refGray, boxes, pad, canon) {
+  const ink = inkOf(refGray);
+  const W = ink.cols, D = ink.data;
+  const out = boxes.map((q) => ({
+    question: q.question,
+    windows: q.boxes.map((b) => {
+      const x0 = Math.round(b.x * canon), y0 = Math.round(b.y * canon);
+      const w0 = Math.round(b.width * canon), h0 = Math.round(b.height * canon);
+      let minx = Infinity, miny = Infinity, maxx = -1, maxy = -1;
+      for (let y = y0 + 2; y < y0 + h0 - 2; y++) {
+        for (let x = x0 + 2; x < x0 + w0 - 2; x++) {
+          if (D[y * W + x] > 60) {
+            if (x < minx) minx = x;
+            if (x > maxx) maxx = x;
+            if (y < miny) miny = y;
+            if (y > maxy) maxy = y;
+          }
+        }
+      }
+      if (maxx < 0) { // no printed target found; fall back to the cell centre
+        const cx = x0 + w0 / 2, cy = y0 + h0 / 2;
+        minx = cx - 6; maxx = cx + 6; miny = cy - 6; maxy = cy + 6;
+      }
+      let x = Math.round(minx) - pad, y = Math.round(miny) - pad;
+      let w = Math.round(maxx - minx) + 1 + 2 * pad;
+      let h = Math.round(maxy - miny) + 1 + 2 * pad;
+      const lx = x0 + 1, ly = y0 + 1, rx = x0 + w0 - 1, ry = y0 + h0 - 1;
+      if (x < lx) { w -= lx - x; x = lx; }
+      if (y < ly) { h -= ly - y; y = ly; }
+      if (x + w > rx) w = rx - x;
+      if (y + h > ry) h = ry - y;
+      return { x, y, width: w, height: h };
+    }),
+  }));
+  ink.delete();
+  return out;
+}
+
+// One template strip per question row, used for local re-registration.
+function rowStrips(refFlat, boxes, canon, searchPx) {
+  return boxes.map((q) => {
+    const ys = q.boxes.map((b) => Math.round(b.y * canon));
+    const hs = q.boxes.map((b) => Math.round(b.height * canon));
+    const y0 = Math.min.apply(null, ys);
+    const y1 = Math.max.apply(null, ys.map((v, i) => v + hs[i]));
+    const y = Math.max(searchPx, y0);
+    const rect = new cv.Rect(260, y, 880, Math.min(y1 - y0, refFlat.rows - y - searchPx));
+    const view = refFlat.roi(rect);
+    const strip = new cv.Mat();
+    view.copyTo(strip); // clone() would alias refFlat
+    view.delete();
+    return { question: q.question, rect, strip };
+  });
+}
+
+// Locate each row strip in the page over +/- searchPx. Absorbs page curl and
+// residual perspective that one global homography cannot.
+function rowOffsets(pageFlat, strips, searchPx, minQuality) {
+  const raw = strips.map(({ rect, strip }) => {
+    const hx = rect.x - searchPx, hy = rect.y - searchPx;
+    const hw = rect.width + 2 * searchPx, hh = rect.height + 2 * searchPx;
+    if (hx < 0 || hy < 0 || hx + hw > pageFlat.cols || hy + hh > pageFlat.rows) {
+      return { dx: 0, dy: 0, q: 0 };
+    }
+    const hay = pageFlat.roi(new cv.Rect(hx, hy, hw, hh));
+    const res = new cv.Mat();
+    cv.matchTemplate(hay, strip, res, cv.TM_CCOEFF_NORMED);
+    const mm = cv.minMaxLoc(res);
+    const o = { dx: mm.maxLoc.x - searchPx, dy: mm.maxLoc.y - searchPx, q: mm.maxVal };
+    hay.delete(); res.delete();
+    return o;
+  });
+  const good = raw.filter((r) => r.q >= minQuality);
+  const mdx = medianOf(good.map((r) => r.dx));
+  const mdy = medianOf(good.map((r) => r.dy));
+  return raw.map((r) => {
+    const ok = r.q >= minQuality &&
+      Math.abs(r.dx) <= searchPx && Math.abs(r.dy) <= searchPx &&
+      Math.abs(r.dx - mdx) <= 5 && Math.abs(r.dy - mdy) <= 5;
+    return ok ? r : { dx: mdx, dy: mdy, q: r.q, filled: true };
+  });
+}
+
+function medianOf(a) {
+  if (!a.length) return 0;
+  const s = a.slice().sort((x, y) => x - y);
+  return s[s.length >> 1];
+}
+
+// Rebuild the page with each row band shifted into template registration.
+function applyRowOffsets(gray, strips, offs) {
+  const fixed = new cv.Mat();
+  gray.copyTo(fixed); // NB: gray.clone() would alias gray in this build
+  const src = gray.data, dst = fixed.data, W = gray.cols;
+  strips.forEach((s, i) => {
+    const dx = offs[i].dx, dy = offs[i].dy;
+    if (!dx && !dy) return;
+    const r = s.rect;
+    const sx = r.x + dx, sy = r.y + dy;
+    if (sx < 0 || sy < 0 || sx + r.width > gray.cols || sy + r.height > gray.rows) return;
+    for (let yy = 0; yy < r.height; yy++) {
+      const so = (sy + yy) * W + sx;
+      dst.set(src.subarray(so, so + r.width), (r.y + yy) * W + r.x);
+    }
+  });
+  return fixed;
+}
+
+// Binary map of ink the blank form does not explain.
+function residualMask(gray, inkRefDil, inkDelta) {
+  const ink = inkOf(gray);
+  const resid = new cv.Mat();
+  cv.subtract(ink, inkRefDil, resid); // 8U saturating: >0 only where page ink is new
+  const mask = new cv.Mat();
+  cv.threshold(resid, mask, inkDelta, 255, cv.THRESH_BINARY);
+  const ko = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+  cv.morphologyEx(mask, mask, cv.MORPH_OPEN, ko); // drop JPEG/sensor speckle
+  ink.delete(); resid.delete(); ko.delete();
+  return mask;
 }
 
 function doInit(msg) {
@@ -61,13 +245,25 @@ function doInit(msg) {
     r.gray.delete();
     r.kp.delete();
     r.des.delete();
+    if (r.inkDil) r.inkDil.delete();
+    if (r.strips) r.strips.forEach((st) => st.strip.delete());
   });
-  refs = msg.refs.map((r) => {
+  refs = msg.refs.map((r, i) => {
     const mat = matFromBuf(r.buffer, r.width, r.height);
     const gray = toGray(mat);
     mat.delete();
     const { kp, des } = orbFeatures(gray);
-    return { gray, kp, des, width: r.width, height: r.height };
+    const P = cfg.detect;
+    const boxes = cfg.boxesByPage[i] || [];
+    const flat = flatField(gray);
+    const strips = rowStrips(flat, boxes, cfg.canonScale, P.searchPx);
+    flat.delete(); // strips own copies; nothing else needs the flat reference
+    return {
+      gray, kp, des, width: r.width, height: r.height,
+      inkDil: refInkDilated(gray, P.tolerancePx),
+      windows: targetWindows(gray, boxes, P.padPx, cfg.canonScale),
+      strips,
+    };
   });
 }
 
@@ -154,43 +350,83 @@ function warpFromCorners(photo, corners, pageIndex) {
   return aligned;
 }
 
-function darkFraction(grayData, W, box, scale) {
-  const x = Math.round(box.x * scale);
-  const y = Math.round(box.y * scale);
-  const w = Math.round(box.width * scale);
-  const h = Math.round(box.height * scale);
-  let dark = 0;
-  let total = 0;
-  for (let yy = y; yy < y + h; yy++) {
-    for (let xx = x; xx < x + w; xx++) {
-      total++;
-      if (grayData[yy * W + xx] < cfg.detect.darkThreshold) dark++;
-    }
-  }
-  return total ? dark / total : 0;
-}
-
 function detectAnswers(alignedMat, pageIndex) {
-  const gray = toGray(alignedMat);
-  const W = gray.cols;
-  const data = gray.data; // Uint8, length W*H
+  const r = refs[pageIndex];
   const P = cfg.detect;
-  const out = cfg.boxesByPage[pageIndex].map((q) => {
-    const scores = q.boxes.map((b) => darkFraction(data, W, b, cfg.canonScale));
-    const ranked = scores.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v);
-    const top = ranked[0];
-    const sec = ranked[1];
-    const win =
-      top.v >= P.minFill &&
-      top.v >= sec.v * P.minRatio &&
-      top.v - sec.v >= P.minMargin &&
-      sec.v < P.saturated;
-    const selectedIndex = win ? top.i : null;
-    const confidence = top.v > 0 ? Math.max(0, (top.v - sec.v) / top.v) : 0;
-    return { question: q.question, scores, selectedIndex, confidence };
-  });
+  const gray = toGray(alignedMat);
+
+  // 1. Re-register each answer row locally (absorbs curl / residual perspective).
+  const pageFlat = flatField(gray);
+  const offsets = rowOffsets(pageFlat, r.strips, P.searchPx, P.minRowQuality);
+  pageFlat.delete();
+  const fixed = applyRowOffsets(gray, r.strips, offsets);
   gray.delete();
-  return out;
+
+  // 2. Difference against the blank template.
+  const mask = residualMask(fixed, r.inkDil, P.inkDelta);
+  fixed.delete();
+
+  // 3. Score the target window of every cell.
+  const scored = r.windows.map((q) => ({
+    question: q.question,
+    scores: q.windows.map((w) => {
+      if (w.width <= 0 || w.height <= 0) return 0;
+      const roi = mask.roi(new cv.Rect(w.x, w.y, w.width, w.height));
+      const v = cv.countNonZero(roi) / (w.width * w.height);
+      roi.delete();
+      return v;
+    }),
+  }));
+  mask.delete();
+
+  // 4. Page-wide noise floor. With 123 cells and at most 41 marks, most cells
+  //    are guaranteed blank, so their spread is a free estimate of the floor.
+  const all = [];
+  scored.forEach((q) => q.scores.forEach((v) => all.push(v)));
+  const med = medianOf(all);
+  const mad = medianOf(all.map((v) => Math.abs(v - med)));
+  const floor = Math.max(P.minInk, med + 6 * (1.4826 * mad + 1e-6));
+
+  const detection = scored.map(({ question, scores }) => {
+    const ranked = scores.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v);
+    const top = ranked[0], sec = ranked[1];
+    const multi = sec.v >= floor && sec.v >= P.multiRatio * top.v;
+    const win =
+      top.v >= floor &&
+      top.v >= P.minRatio * sec.v &&
+      top.v - sec.v >= P.minMargin &&
+      !multi;
+    // Confidence folds in absolute strength, not just separation: the old
+    // (top-sec)/top returned 1.0 for a barely-there mark with a clean runner-up,
+    // so marginal reads were never flagged for review.
+    const separation = top.v > 0 ? (top.v - sec.v) / top.v : 0;
+    const strength = Math.min(1, top.v / P.strongInk);
+    return {
+      question,
+      scores,
+      selectedIndex: win ? top.i : null,
+      confidence: separation * strength,
+      reason: win ? null : multi ? "multiple-marks" : top.v < floor ? "no-mark" : "ambiguous",
+    };
+  });
+
+  const rowQuality = offsets.map((o) => o.q);
+  return {
+    detection,
+    quality: {
+      residualMedian: med,
+      residualMad: mad,
+      floor,
+      // The single most useful derived signal: if the template is not
+      // cancelling, the page is misaligned or too poor to read -- say so
+      // instead of silently reporting 41 answers.
+      noisy: med > P.noisyPage,
+      rowQualityMin: Math.min.apply(null, rowQuality),
+      rowQualityMedian: medianOf(rowQuality),
+      rowsFilled: offsets.filter((o) => o.filled).length,
+      marksFound: detection.filter((d) => d.selectedIndex !== null).length,
+    },
+  };
 }
 
 function alignedToTransfer(alignedMat) {
@@ -223,7 +459,7 @@ function doProcess(msg) {
   if (!best || !best.alignedMat) {
     return { ok: false, pageIndex: best ? best.i : 0, inliers: 0, matches: best ? best.matches : 0 };
   }
-  const detection = detectAnswers(best.alignedMat, best.i);
+  const det = detectAnswers(best.alignedMat, best.i);
   const aligned = alignedToTransfer(best.alignedMat);
   best.alignedMat.delete();
   return {
@@ -232,7 +468,8 @@ function doProcess(msg) {
     inliers: best.inliers,
     matches: best.matches,
     aligned,
-    detection,
+    detection: det.detection,
+    quality: det.quality,
   };
 }
 
@@ -240,10 +477,13 @@ function doWarp(msg) {
   const photo = matFromBuf(msg.page.buffer, msg.page.width, msg.page.height);
   const alignedMat = warpFromCorners(photo, msg.corners, msg.pageIndex);
   photo.delete();
-  const detection = detectAnswers(alignedMat, msg.pageIndex);
+  const det = detectAnswers(alignedMat, msg.pageIndex);
   const aligned = alignedToTransfer(alignedMat);
   alignedMat.delete();
-  return { ok: true, pageIndex: msg.pageIndex, inliers: null, matches: null, aligned, detection };
+  return {
+    ok: true, pageIndex: msg.pageIndex, inliers: null, matches: null,
+    aligned, detection: det.detection, quality: det.quality,
+  };
 }
 
 let ready = false;
