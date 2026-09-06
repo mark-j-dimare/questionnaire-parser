@@ -196,9 +196,16 @@ function App() {
     detection.forEach((d) => {
       answers[d.question] = d.selectedIndex;
     });
-    const inliers = result.inliers || 0;
-    const recognized = fields ? true : !!result.alignedCanvas && inliers >= RECOGNIZE_MIN;
-    const strong = inliers >= STRONG_INLIERS;
+    // A corner-aligned page has no inlier count -- the worker returns null,
+    // because there was no feature match to count. `|| 0` would turn that
+    // "not applicable" into "zero inliers, therefore unrecognized". Nothing
+    // currently routes a manual warp through here, but the trap is one edit away.
+    const inliers = typeof result.inliers === "number" ? result.inliers : null;
+    const aligned = !!result.alignedCanvas;
+    const recognized = fields
+      ? true
+      : aligned && (inliers === null || inliers >= RECOGNIZE_MIN);
+    const strong = inliers === null ? aligned : inliers >= STRONG_INLIERS;
     const pageIndex = fields ? fields.pageIndex : result.pageIndex;
     // Where the answer table's corners landed in the ORIGINAL photo, so the grid
     // overlay can start from the automatic alignment rather than a blind guess.
@@ -213,7 +220,7 @@ function App() {
       alignedUrl: result.alignedCanvas
         ? result.alignedCanvas.toDataURL("image/png")
         : null,
-      inliers: result.inliers,
+      inliers, // number, or null when the page was not feature-aligned
       matches: result.matches,
       recognized,
       aligned: recognized && strong,
