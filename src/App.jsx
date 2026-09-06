@@ -665,7 +665,7 @@ function App() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/*,application/pdf"
+        accept="image/*,.heic,.heif,application/pdf"
         multiple
         className="hidden"
         onChange={(e) => {

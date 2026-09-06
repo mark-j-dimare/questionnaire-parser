@@ -50,7 +50,7 @@ const Uploader = ({ onFiles, busy }) => {
       <input
         ref={inputRef}
         type="file"
-        accept="image/*,application/pdf"
+        accept="image/*,.heic,.heif,application/pdf"
         multiple
         aria-label="Upload form images or PDF"
         className="hidden"

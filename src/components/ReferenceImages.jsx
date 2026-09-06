@@ -38,7 +38,7 @@ const ReferenceImages = ({ images, onAdd, onClear, busy }) => {
     <input
       ref={inputRef}
       type="file"
-      accept="image/*,application/pdf"
+      accept="image/*,.heic,.heif,application/pdf"
       multiple
       className="hidden"
       onChange={(e) => {
