@@ -6,7 +6,8 @@ import GridOverlay from "./components/GridOverlay";
 import ManualEntry from "./components/ManualEntry";
 import ReferenceImages from "./components/ReferenceImages";
 import { QUESTIONS, TABLE_QUADS } from "./data/scaredForm";
-import { fileToCanvases } from "./utils/imaging";
+import { fileToCanvases, looksLikePdf } from "./utils/imaging";
+import { extractPdfAnswers } from "./utils/pdfExtract";
 import { initCv, processCanvas, warpCanvas } from "./utils/cvClient";
 import { computeScore } from "./utils/score";
 import { flagStats } from "./utils/flags";
@@ -62,6 +63,25 @@ function makeThumb(canvas, targetW = 100) {
 // only the missing page (which is what a plain if/else chain does) tells the
 // user to add a page while saying nothing about the duplicate they need to
 // remove -- and two identical "Page 1" cards look like a rendering glitch.
+// Turn extracted PDF form-field values into the same per-question shape the CV
+// detector emits, so scoring, flagging and the overlay treat both identically.
+// confidence 1 because a field value is not a guess -- but the answers still go
+// through the normal human review, per the product model.
+function detectionFromFields(fields) {
+  return QUESTIONS.filter((q) => q.page === fields.pageIndex).map((q) => {
+    const conflicted = fields.conflicts.includes(q.question);
+    const value = fields.answers[q.question];
+    return {
+      question: q.question,
+      scores: [],
+      selectedIndex: conflicted || value == null ? null : value,
+      confidence: conflicted || value == null ? 0 : 1,
+      reason: conflicted ? "multiple-marks" : value == null ? "no-mark" : null,
+      source: "pdf-field",
+    };
+  });
+}
+
 function pageProblemText(missing, duplicate) {
   const list = (a) => a.map((i) => i + 1).join(" & ");
   if (duplicate.length && missing.length) {
@@ -164,21 +184,29 @@ function App() {
   const fileInputRef = useRef(null);
   const openFilePicker = () => fileInputRef.current?.click();
 
-  const pageFromResult = (result, canvas, fileName) => {
+  const pageFromResult = (result, canvas, fileName, fields) => {
+    // A digitally-filled PDF carries its answers as form-field values. When we
+    // have those, they ARE the answers -- exact, and independent of whether the
+    // marks rendered at all. Alignment still comes from the CV pass so the grid
+    // overlay works, but the reading does not depend on it.
+    const detection = fields
+      ? detectionFromFields(fields)
+      : result.detection;
     const answers = {};
-    result.detection.forEach((d) => {
+    detection.forEach((d) => {
       answers[d.question] = d.selectedIndex;
     });
     const inliers = result.inliers || 0;
-    const recognized = !!result.alignedCanvas && inliers >= RECOGNIZE_MIN;
+    const recognized = fields ? true : !!result.alignedCanvas && inliers >= RECOGNIZE_MIN;
     const strong = inliers >= STRONG_INLIERS;
+    const pageIndex = fields ? fields.pageIndex : result.pageIndex;
     // Where the answer table's corners landed in the ORIGINAL photo, so the grid
     // overlay can start from the automatic alignment rather than a blind guess.
     const corners = cornersFromHomography(result.homography, result.pageIndex);
     return {
       id: ++idRef.current,
-      pageIndex: result.pageIndex,
-      label: `Page ${result.pageIndex + 1}`,
+      pageIndex,
+      label: `Page ${pageIndex + 1}`,
       fileName,
       sourceCanvas: canvas,
       thumbUrl: makeThumb(canvas),
@@ -189,9 +217,15 @@ function App() {
       matches: result.matches,
       recognized,
       aligned: recognized && strong,
-      alignMode: !recognized ? "unrecognized" : strong ? "auto" : "auto-weak",
+      alignMode: fields
+        ? "pdf-fields"
+        : !recognized
+        ? "unrecognized"
+        : strong
+        ? "auto"
+        : "auto-weak",
       answers,
-      detection: result.detection,
+      detection,
       quality: result.quality || null,
       corners,
       confirmed: new Set(), // questions the user has set/confirmed by hand
@@ -213,7 +247,10 @@ function App() {
       for (const file of fileList) {
         try {
           const canvases = await fileToCanvases(file);
-          canvases.forEach((canvas) => incoming.push({ canvas, name: file.name }));
+          const fields = looksLikePdf(file) ? await extractPdfAnswers(file) : null;
+          canvases.forEach((canvas, i) =>
+            incoming.push({ canvas, name: file.name, fields: (fields && fields[i]) || null })
+          );
         } catch (e) {
           setError(`Could not read "${file.name}": ${e.message}`);
         }
@@ -223,7 +260,9 @@ function App() {
       for (let i = 0; i < incoming.length; i++) {
         setStage(`Reading page ${i + 1} of ${incoming.length}…`);
         const result = await processCanvas(incoming[i].canvas);
-        created.push(pageFromResult(result, incoming[i].canvas, incoming[i].name));
+        created.push(
+          pageFromResult(result, incoming[i].canvas, incoming[i].name, incoming[i].fields)
+        );
       }
       setPages((prev) =>
         [...prev, ...created].sort((a, b) => a.pageIndex - b.pageIndex)

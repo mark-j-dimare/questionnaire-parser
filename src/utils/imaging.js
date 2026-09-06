@@ -19,7 +19,7 @@ const IMAGE_EXT = /\.(jpe?g|png|gif|webp|bmp|avif|tiff?|heic|heif)$/i;
 
 const extOf = (name = "") => (name.match(/\.([a-z0-9]+)$/i)?.[1] || "").toUpperCase();
 
-function looksLikePdf(file) {
+export function looksLikePdf(file) {
   return file.type === "application/pdf" || PDF_EXT.test(file.name || "");
 }
 

@@ -83,7 +83,12 @@ const PageReview = ({ page, onChangeAnswer, onManualRealign, onRemove }) => {
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2.5">
           <h3 className="text-base font-semibold text-slate-900">{page.label}</h3>
-          {page.alignMode === "manual" ? (
+          {page.alignMode === "pdf-fields" ? (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 px-2.5 py-0.5 text-xs font-medium text-sky-800 ring-1 ring-sky-200">
+              <span className="h-1.5 w-1.5 rounded-full bg-sky-600" aria-hidden="true" />
+              Read from the PDF&apos;s form fields
+            </span>
+          ) : page.alignMode === "manual" ? (
             <span className="inline-flex items-center gap-1.5 rounded-full bg-teal-50 px-2.5 py-0.5 text-xs font-medium text-teal-700 ring-1 ring-teal-200">
               <span className="h-1.5 w-1.5 rounded-full bg-teal-500" aria-hidden="true" />
               Aligned manually
